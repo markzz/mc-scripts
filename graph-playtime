@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+
+# Copyright (c) 2015, Mark Weiman (markzz)
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+from datetime import datetime, timedelta
+from os import listdir
+from os.path import isfile, join
+import re
+import plotly.plotly as py
+import plotly.graph_objs as go
+
+# change these to your plot.ly information
+py.sign_in('user', 'api_key')
+
+# be sure to use trailing slash
+path = '/path/to/logs/'
+
+# get list of files in path
+onlyfiles = [ f for f in listdir(path) if isfile(join(path,f)) ]
+
+# UNUSED
+errors_occurred = False
+
+# dictionary ['date', (tuple of lines,)]
+important_lines = {}
+
+# list of lines that include UUIDs from logs
+UUID_lines = []
+
+# extract important data
+for _file in onlyfiles:
+    if _file != 'latest.log':
+        with open(path + _file) as log:
+            log = log.readlines()
+        
+        # format date yyyy-mm-dd
+        date = '-'.join(_file.split('-')[:3])
+        
+        # store lines in proper tuples
+        lines = ()
+        for line in log:
+            if 'logged in' in line:
+                lines = lines + (line.strip(),)
+            elif 'left the game' in line:
+                lines = lines + (line.strip(),)
+            elif 'UUID of player' in line:
+                trimmed_line = line.split(': ')[1].strip()
+                if trimmed_line not in UUID_lines:
+                    UUID_lines = UUID_lines + [trimmed_line]
+        
+        # make sure that if one date is separated into many logs that the data gets stored properly
+        if date not in important_lines:
+            important_lines[date] = lines
+        else:
+            important_lines[date] = important_lines[date] + lines
+
+# get names of all players who tried to use the server
+names = []
+for key in sorted(important_lines):
+    for line in important_lines[key]:
+        name = re.search('\[Server thread/INFO\]: (.*) left|\[Server thread/INFO\]: (.*)\[/\d{1,3}\.', line)
+        
+        if name and name is not None:
+            name = name.group(1)
+            if not name in names:
+                names = names + [name]
+
+# make dictionary of UUIDs (user: UUID)
+UUIDs = {}
+for UUID_line in UUID_lines:
+    m = re.search('player (.*) is (.*)', UUID_line)
+    UUIDs[m.groups()[0]] = m.groups()[1]
+
+# make dictionary of all times per username
+times = {}
+for name in names:
+    logged_in = False
+    total_time = timedelta(0,0)
+    if name is not None:
+        for key in sorted(important_lines):
+            for line in important_lines[key]:
+                
+                # do check if user is relevent to what name we are looking at
+                check_user = re.search('\[Server thread/INFO\]: (.*) left|\[Server thread/INFO\]: (.*)\[/', line)
+                if check_user is not None and name in check_user.groups():
+                
+                    # if logged_in is false and we're missing a log in entry
+                    # assume that they were playing when the year started and start time there
+                    if not logged_in and 'left the game' in line:
+                        log_in_time = datetime(2014, 1, 1, 0, 0, 0)
+                        
+                        # look for timestamp and username
+                        m = re.search('\[(.*)\] \[Server thread/INFO\]: (.*) left the game', line)
+                        
+                        if m is not None and m.groups()[1] == name:
+                            time_array = m.groups()[0].split(':')
+                            log_out_time = datetime(int(key.split('-')[0]), int(key.split('-')[1]), int(key.split('-')[2]), \
+                                                    int(time_array[0]), int(time_array[1]), int(time_array[2]))
+                            total_time = total_time + (log_out_time - log_in_time)
+                            
+                    
+                    # if logged out, look for when they next logged in
+                    elif not logged_in and 'logged in' in line:
+                    
+                        # look for timestamp and username
+                        m = re.search('\[(.*)\] \[Server thread/INFO\]: (.*)\[/', line)
+                        
+                        if m is not None and m.groups()[1] == name:
+                            time_array = m.groups()[0].split(':')
+                            log_in_time = datetime(int(key.split('-')[0]), int(key.split('-')[1]), int(key.split('-')[2]), \
+                                                   int(time_array[0]), int(time_array[1]), int(time_array[2]))
+                            logged_in = True
+                    
+                    # if logged in, look for when they next logged out
+                    # TODO: if never appears assume playing past end of year
+                    elif logged_in and 'left the game' in line:
+                    
+                        # look for timestamp and username
+                        m = re.search('\[(.*)\] \[Server thread/INFO\]: (.*) left the game', line)
+                        if m is not None and m.groups()[1] == name:
+                            time_array = m.groups()[0].split(':')
+                            log_out_time = datetime(int(key.split('-')[0]), int(key.split('-')[1]), int(key.split('-')[2]), \
+                                                    int(time_array[0]), int(time_array[1]), int(time_array[2]))
+                            total_time = total_time + (log_out_time - log_in_time)
+                            logged_in = False
+                    
+                    # if logged in and another logged in entry appears tell user that this happened on specific date
+                    else:
+                        print('%s had double log in on date %s' % (name,key,))
+                        errors_occurred = True
+    
+    # if still logged in after year ends.
+    if logged_in:
+        log_out_time = datetime(2015, 1, 1, 0, 0, 0)
+        total_time = total_time + (log_out_time - log_in_time)
+    
+    times[name] = total_time
+
+# make dictionary (UUID: username)
+UUID_to_names = {}
+for key, value in UUIDs.items():
+    UUID_to_names.setdefault(value, []).append(key)
+
+
+# merge names together (in case a user changed his/her name)
+# and give them final values in a float rather than timedelta()
+final_data = {}
+for key, value in UUID_to_names.items():
+    new_val = timedelta(0,0)
+    for value in UUID_to_names[key]:
+        try:
+            new_val = new_val + times[value]
+        except KeyError:
+            continue
+    final_data[UUID_to_names[key][0]] = new_val.total_seconds() / 3600
+
+# remove people with 0.0 hours of playtime
+# these people are people who most likely tried to log in,
+# but weren't on the whitelist :(
+for key in sorted(final_data, key=str.lower):
+    if key is not None and final_data[key] == 0:
+        final_data.pop(key, None)
+
+
+# Generate lists of x and y values
+x_vals = y_vals = []
+for key in sorted(final_data, key=str.lower):
+    x_vals = x_vals + [key]
+    y_vals = y_vals + [final_data[key]]
+
+# organize data for plot.ly
+data = [
+    go.Bar(
+        x = x_vals,
+        y = y_vals
+    )
+]
+
+# Make labels for plot
+layout = go.Layout(
+    title = 'title',
+    xaxis = dict(
+        title = 'Player'
+    ),
+    yaxis = dict(
+        title = 'Hours Played'
+    )
+)
+
+# format plot and send data to plot.ly for graph creation
+fig = go.Figure(data=data, layout=layout)
+plot_url = py.plot(fig, filename='filename')
+
